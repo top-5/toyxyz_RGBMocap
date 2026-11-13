@@ -279,6 +279,20 @@ def run(args):
                                    stats_path=config['motion']['stats'], device='cuda')
         result = run_motion(predictor, sequence, device='cuda')
         parameters = {key: value.detach().cpu() for key, value in result['pred_soma_params_global'].items()}
+        # camera-frame result + intrinsics for seed's bake (sidecar; the original gemx_result FILES are unchanged)
+        def _find_k(obj, depth=0):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k == 'K_fullimg':
+                        return v
+                    found = _find_k(v, depth + 1) if depth < 3 else None
+                    if found is not None:
+                        return found
+            return None
+        _k = _find_k(sequence)
+        _incam = {key: value.detach().cpu().numpy() for key, value in result['pred_soma_params_incam'].items()}
+        np.savez(out / 'soma-incam.npz', K_fullimg=(_k.detach().cpu().numpy() if _k is not None else np.zeros((0, 3, 3))),
+                 coordinates=np.array('camera_meters (GEM-X incam; OpenCV camera axes)'), **_incam)
         shapes = dict(global_orient=3, body_pose=228, transl=3, identity_coeffs=128, scale_params=57)
         if set(parameters) != set(shapes):
             raise ValueError('Unexpected SOMA parameters')
