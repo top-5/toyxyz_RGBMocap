@@ -46,8 +46,8 @@ PyTorch peak allocated: **3,737,261,568 bytes (3.48 GiB)**; reserved:
 3,925,868,544 bytes. NVML sampled this process every 0.2 seconds across GPUs:
 **4,643,094,528 bytes (4.32 GiB)** peak including context, ORT and Warp.
 Sampling can miss shorter transients. These are shared-host observations,
-not isolated benchmark guarantees. Warp kernels were warmed by prior tests;
-initial compilation can take longer.
+not isolated benchmark guarantees. The run used a new output-local Warp cache;
+its log records kernel compilation (495 ms alignment, 54 ms skinning).
 
 `headless-full-06/report.json` contains timings/versions/memory;
 `validation.json` records the actual array dimensions. Validation passed
