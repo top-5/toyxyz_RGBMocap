@@ -16,6 +16,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +38,34 @@ class Stages:
         self.times = {}
         self.name = None
         self.started = None
+        self.peak_process_vram_bytes = None
+        self.monitor_stop = threading.Event()
+        self.monitor = None
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(pynvml.nvmlDeviceGetCount())]
+
+            def sample():
+                while not self.monitor_stop.is_set():
+                    try:
+                        used = sum(p.usedGpuMemory for handle in handles
+                                   for p in pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+                                   if p.pid == os.getpid() and p.usedGpuMemory < 2**60)
+                        self.peak_process_vram_bytes = max(self.peak_process_vram_bytes or 0, used)
+                    except pynvml.NVMLError:
+                        pass
+                    self.monitor_stop.wait(.2)
+
+            self.monitor = threading.Thread(target=sample, daemon=True)
+            self.monitor.start()
+        except (ImportError, OSError, RuntimeError):
+            pass
+
+    def stop_monitor(self):
+        self.monitor_stop.set()
+        if self.monitor is not None:
+            self.monitor.join(timeout=1)
 
     def begin(self, name):
         self.finish()
@@ -51,17 +80,23 @@ class Stages:
 
 
 @contextmanager
-def seed_adapters():
+def seed_adapters(derived_detector=None):
     """Scope compatibility changes to this process, leaving upstream untouched."""
     import onnxruntime as ort
     import soma
     from soma import SOMALayer, Unit
     import gem.common.soma.body as body
     import gem.inference.body_video as video
+    from transformers.models.dinov3_vit.modeling_dinov3_vit import ALL_ATTENTION_FUNCTIONS
 
     if soma.__version__ != '0.3.4':
         raise RuntimeError('This seed adapter requires py-soma-x 0.3.4')
     original_factory, original_detector = body._build_official_soma_runtime, video.YOLOXONNX
+    adapt_attention = not hasattr(ALL_ATTENTION_FUNCTIONS, 'get_interface')
+    if adapt_attention:
+        # Transformers 5 renamed the mapping lookup used by GEM-X's detector.
+        # Keep the requested backend/default and its actual attention kernel.
+        ALL_ATTENTION_FUNCTIONS.get_interface = ALL_ATTENTION_FUNCTIONS.get
 
     def soma_runtime(config):
         if config.procedural_reference != 'runtime' or str(config.device) != 'cuda':
@@ -86,16 +121,22 @@ def seed_adapters():
                                             providers=['CUDAExecutionProvider'])
             self.sess.disable_fallback()
             self.execution_providers = self.sess.get_providers()
-            if self.execution_providers != ['CUDAExecutionProvider']:
+            if 'CUDAExecutionProvider' not in self.execution_providers:
                 raise RuntimeError(f'Unexpected detector providers: {self.execution_providers}')
             self.input_size, self.score_thr, self.nms_thr = input_size, score_thr, nms_thr
 
     body._build_official_soma_runtime = soma_runtime
-    video.YOLOXONNX = CudaDetector
+    if derived_detector is None:
+        video.YOLOXONNX = CudaDetector
+    else:
+        from tools.gemx_onnx_cuda import detector_class
+        video.YOLOXONNX = detector_class(original_detector, derived_detector)
     try:
         yield
     finally:
         body._build_official_soma_runtime, video.YOLOXONNX = original_factory, original_detector
+        if adapt_attention:
+            del ALL_ATTENTION_FUNCTIONS.get_interface
 
 
 def probe(path):
@@ -218,7 +259,8 @@ def run(args):
     config['motion']['stats'] = str(models['gemx_stats'])
     free, _ = torch.cuda.mem_get_info()
     batch = 1 if free < 5 * 1024**3 else 4
-    with seed_adapters():
+    derived = out / 'yolox-prenms-cuda.onnx' if args.detector == 'cuda-prenms' else None
+    with seed_adapters(derived):
         for attempt in range(2):
             try:
                 for section in ('pose', 'observations'):
@@ -254,6 +296,20 @@ def run(args):
         stages.begin('evaluate_soma')
         engine = MotionGeometry(str(MODELS), device='cuda', chunk_size=16)
         vertical_offset = evaluate(engine, parameters, out, torch, np)
+        stages.begin('export_bind_sidecar')
+        neutral = {key: (torch.zeros_like(value[:1]) if key in ('global_orient', 'body_pose', 'transl')
+                         else value[:1]).to(device='cuda', dtype=torch.float32)
+                   for key, value in parameters.items()}
+        with torch.inference_mode():
+            bind = engine.body_model(**neutral, pose2rot=True, apply_correctives=True,
+                                     repose_to_bind_pose=True)['vertices'][0].cpu().numpy()
+        bind[:, 1] -= bind[:, 1].min()
+        weights = engine.body_model.runtime.public_skinning_weights()[:, 1:].cpu().numpy()
+        if (bind.shape != (18056, 3) or weights.shape != (18056, 77)
+                or not np.isfinite(bind).all() or not np.isfinite(weights).all()
+                or (weights < 0).any() or not np.allclose(weights.sum(axis=1), 1, atol=1e-5)):
+            raise ValueError('Invalid auxiliary SOMA bind geometry or skin weights')
+        np.savez(out / 'soma-bind.npz', bind_vertices=bind, skin_weights=weights)
     stages.begin('publish')
     if any(file_stat(path) != stamp for path, stamp in stamps.items()):
         raise ValueError('Input files changed during inference')
@@ -264,17 +320,23 @@ def run(args):
     atomic_json(out / RECEIPT, dict(version=1, frames=length, fps=FPS, skeleton='soma-native77',
                 virtual_root='omitted', units='metres', axes='native-y-up', transforms='joint-to-world',
                 geometry='soma-mid-correctives', camera='assumed-static', vertical_offset_m=vertical_offset,
-                runtime=dict(engine_revision=revision, versions=versions, entrypoint='tools/gemx_headless.py'),
+                runtime=dict(engine_revision=revision, versions=versions, entrypoint='tools/gemx_headless.py',
+                             detector=args.detector,
+                             derived_detector_sha256=sha256(derived) if derived else None),
                 models={row['key']: row['expected_sha256'] for row in manifest},
                 outputs={name: file_stat(out / name) for name in FILES}))
     stages.finish()
+    stages.stop_monitor()
     report = dict(status='complete', frames=length, fps=FPS, seconds_per_stage=stages.times,
                   total_seconds=time.monotonic() - began, image_batch=batch,
                   peak_vram_allocated_bytes=torch.cuda.max_memory_allocated(),
                   peak_vram_reserved_bytes=torch.cuda.max_memory_reserved(),
                   peak_vram_scope='PyTorch allocator only; excludes ONNX Runtime and Warp',
+                  peak_process_vram_bytes=stages.peak_process_vram_bytes,
+                  process_vram_scope='NVML own PID sampled every 0.2 seconds across GPUs',
                   device=torch.cuda.get_device_name(), versions=versions, engine_revision=revision,
-                  camera='assumed-static', outputs=list(FILES) + [RECEIPT],
+                  camera='assumed-static', detector=args.detector,
+                  outputs=list(FILES) + [RECEIPT, 'soma-bind.npz'],
                   parameter_shapes={key: list(value.shape) for key, value in parameters.items()})
     atomic_json(out / 'report.json', report)
     print(json.dumps(report, indent=2), flush=True)
@@ -286,6 +348,8 @@ def main():
     parser.add_argument('--out', type=Path, required=True, help='New output directory (never overwrites)')
     parser.add_argument('--start-frame', type=int, default=0, help='Start on the normalized 30 Hz timeline')
     parser.add_argument('--frames', type=int, help='Frame count at 30 Hz; default: remaining video')
+    parser.add_argument('--detector', choices=('cuda-prenms', 'strict-original'), default='cuda-prenms',
+                        help='CUDA graph + CUDA NMS, or reproduce the original strict CUDA graph failure')
     parser.add_argument('--timeout', type=int, default=900, help='Whole-run wall time limit in seconds')
     args = parser.parse_args()
     if args.timeout <= 0:
@@ -307,12 +371,14 @@ def main():
             if hasattr(args, 'stages'):
                 failed_stage = args.stages.name
                 args.stages.finish()
+                args.stages.stop_monitor()
                 torch = args.stages.torch
                 report.update(failed_stage=failed_stage, seconds_per_stage=args.stages.times,
                               total_seconds=time.monotonic() - args.began,
                               peak_vram_allocated_bytes=torch.cuda.max_memory_allocated(),
                               peak_vram_reserved_bytes=torch.cuda.max_memory_reserved(),
                               peak_vram_scope='PyTorch allocator only; excludes ONNX Runtime and Warp',
+                              peak_process_vram_bytes=args.stages.peak_process_vram_bytes,
                               versions=args.versions)
             atomic_json(args.created_output / 'report.json', report)
         raise
