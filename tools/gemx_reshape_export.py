@@ -1,6 +1,11 @@
 """Re-export a GEM-X result with a different SOMA body shape (identity coefficients + bone scales), same motion.
 
 Usage: gemx_reshape_export.py <gemx result dir> <shape.npz with identity_coeffs (1,128), scale_params (1,57)> <out dir>
+       [--keep-floor] [--transl-world <npz with transl_world (T,3)>]
+
+--keep-floor: keep the SOURCE result's floor offset (soma-result.json vertical_offset_m) instead of recomputing it for
+the new body, so the body stays where it was fitted in the source camera. --transl-world: per-frame world-space root
+offsets added to GEM-X's global translation (a camera-frame refit residual rotated into world by the caller).
 
 Reads <gemx>/soma-parameters.npz (GEM-X's global SOMA parameters), replaces identity_coeffs / scale_params on every
 frame, and writes the files tools/gemx_to_glb.py consumes into <out>: soma-rig.npz, soma-world.npy, soma-vertices.npy
@@ -20,7 +25,16 @@ sys.path[:0] = [str(ROOT / "tools"), str(ROOT)]
 
 
 def main():
-    src, shape_file, out = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("src", type=Path)
+    ap.add_argument("shape", type=Path)
+    ap.add_argument("out", type=Path)
+    ap.add_argument("--keep-floor", action="store_true")
+    ap.add_argument("--transl-world", type=Path)
+    a = ap.parse_args()
+    src, shape_file, out = a.src, a.shape, a.out
     out.mkdir(parents=True, exist_ok=False)
     import gemx_headless as gh
     from mocap.gemx_pipeline import evaluate
@@ -34,12 +48,28 @@ def main():
         if not torch.isfinite(v).all():
             raise ValueError(f"non-finite {key}")
         params[key] = v.expand(n, width).contiguous()
+    if a.transl_world is not None:
+        tw = torch.as_tensor(np.load(a.transl_world)["transl_world"], dtype=params["transl"].dtype)
+        if tw.shape != params["transl"].shape or not torch.isfinite(tw).all():
+            raise ValueError(f"transl_world {tuple(tw.shape)} != {tuple(params['transl'].shape)}")
+        params["transl"] = params["transl"] + tw
     np.savez(out / "soma-parameters.npz", **{k: v.numpy() for k, v in params.items()})
     with gh.seed_adapters(None):
         from gem.motion.geometry import MotionGeometry
 
         engine = MotionGeometry(str(gh.MODELS), device="cuda", chunk_size=16)
         offset = evaluate(engine, params, out, torch, np)
+    if a.keep_floor:
+        src_offset = float(json.loads((src / "soma-result.json").read_text())["vertical_offset_m"])
+        dy = src_offset - offset
+        world = np.load(out / "soma-world.npy", mmap_mode="r+")
+        world[:, :, 1, 3] += dy
+        world.flush()
+        verts = np.load(out / "soma-vertices.npy", mmap_mode="r+")
+        verts[:, :, 1] += dy
+        verts.flush()
+        offset = src_offset
+    with gh.seed_adapters(None):
         neutral = {k: (torch.zeros_like(v[:1]) if k in ("global_orient", "body_pose", "transl") else v[:1]).to(
             device="cuda", dtype=torch.float32) for k, v in params.items()}
         with torch.no_grad():
