@@ -84,6 +84,9 @@ def main():
     ap.add_argument("out", type=Path)
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--max-influences", type=int, default=4)
+    ap.add_argument("--texture-from", type=Path, default=None,
+                    help="seed textured GLB on the same SOMA triangles (e.g. runs/<run>/fit/<dir>/texture-bake/"
+                         "soma-direct-textured-tpose.glb): copy its per-corner UVs + base-colour atlas onto this mesh")
     ap.add_argument("--correctives", action="store_true",
                     help="exact surface: per-frame SOMA pose-corrective offsets (inverse-skinned to bind space) as one-hot "
                          "animated morph targets; needs soma-vertices.npy; ~12 bytes x vertices per frame")
@@ -102,15 +105,36 @@ def main():
     if rest.shape != (n_joints, 4, 4) or weights.shape != (len(bind_vertices), n_joints) or len(names) != n_joints:
         raise SystemExit(f"shape mismatch: rest {rest.shape} weights {weights.shape} joints {n_joints} names {len(names)}")
 
+    remap, uv, tex = None, None, None
+    if a.texture_from is not None:
+        import pygltflib
+        src = pygltflib.GLTF2().load(str(a.texture_from)); sblob = src.binary_blob(); sp = src.meshes[0].primitives[0]
+        def sacc(i, dtype=np.float32, n=2):
+            x = src.accessors[i]; v = src.bufferViews[x.bufferView]
+            return np.frombuffer(sblob, dtype, x.count * n, v.byteOffset + (x.byteOffset or 0)).reshape(x.count, n)
+        corner_uv = sacc(sp.attributes.TEXCOORD_0)
+        sidx = sacc(sp.indices, {5125: np.uint32, 5123: np.uint16}[src.accessors[sp.indices].componentType], 1)[:, 0]
+        if len(sidx) != faces.size or not np.array_equal(sidx, np.arange(faces.size)):
+            raise SystemExit("--texture-from: expected a corner-split GLB (one vertex per triangle corner, sequential indices)")
+        corner_vertex = faces.reshape(-1).astype(np.int64)                  # same SOMA triangles in the same order
+        keys = np.concatenate([corner_vertex[:, None].astype(np.float64), corner_uv.astype(np.float64)], 1)
+        uniq, inverse = np.unique(keys, axis=0, return_inverse=True)
+        remap = uniq[:, 0].astype(np.int64); uv = uniq[:, 1:].astype(np.float32)
+        faces = inverse.reshape(-1, 3).astype(np.uint32)
+        img = src.images[src.textures[src.materials[sp.material].pbrMetallicRoughness.baseColorTexture.index].source]
+        iv = src.bufferViews[img.bufferView]
+        tex = dict(bytes=sblob[iv.byteOffset:iv.byteOffset + iv.byteLength], mime=img.mimeType or "image/png")
     joints, w = top_k_weights(weights, a.max_influences)
     inverse_bind = np.linalg.inv(rest)
     rest_local = local_from_world(rest, parents)
     anim_local = local_from_world(world, parents)
 
     buf = Buffer()
-    pos = buf.add(bind_vertices.astype(np.float32), 5126, "VEC3", 34962, minmax=True)
-    jnt = buf.add(joints, 5123, "VEC4", 34962)
-    wgt = buf.add(w, 5126, "VEC4", 34962)
+    R = remap if remap is not None else np.arange(len(bind_vertices))
+    pos = buf.add(bind_vertices[R].astype(np.float32), 5126, "VEC3", 34962, minmax=True)
+    jnt = buf.add(joints[R], 5123, "VEC4", 34962)
+    wgt = buf.add(w[R], 5126, "VEC4", 34962)
+    uvacc = buf.add(uv, 5126, "VEC2", 34962) if uv is not None else None
     idx = buf.add(faces.reshape(-1), 5125, "SCALAR", 34963)
     ibm = buf.add(np.ascontiguousarray(inverse_bind.transpose(0, 2, 1)).astype(np.float32).reshape(n_joints, 16), 5126, "MAT4")
     times = buf.add((np.arange(n_frames) / a.fps).astype(np.float32), 5126, "SCALAR", minmax=True)
@@ -125,7 +149,7 @@ def main():
             blend = np.einsum("vk,vkij->vij", w, skin_t[ji])                      # per-vertex blended skin matrix
             lbs_t = np.einsum("vij,vj->vi", blend[:, :3, :3], bind_vertices) + blend[:, :3, 3]
             delta = np.linalg.solve(blend[:, :3, :3], (np.asarray(posed[t], np.float64) - lbs_t)[..., None])[..., 0]
-            targets.append(dict(POSITION=buf.add(delta.astype(np.float32), 5126, "VEC3", 34962, minmax=True)))
+            targets.append(dict(POSITION=buf.add(delta[R].astype(np.float32), 5126, "VEC3", 34962, minmax=True)))
         morph_weights = buf.add(np.eye(n_frames, dtype=np.float32).reshape(-1), 5126, "SCALAR")
 
     nodes, channels, samplers = [], [], []
@@ -151,12 +175,25 @@ def main():
     gltf = dict(
         asset=dict(version="2.0", generator="toyxyz_RGBMocap seed-linux-headless gemx_to_glb"),
         scene=0, scenes=[dict(nodes=roots + [mesh_node])], nodes=nodes,
-        meshes=[dict(name="SOMA", primitives=[dict(attributes=dict(POSITION=pos, JOINTS_0=jnt, WEIGHTS_0=wgt), indices=idx,
+        meshes=[dict(name="SOMA", primitives=[dict(attributes=dict(POSITION=pos, JOINTS_0=jnt, WEIGHTS_0=wgt,
+                                                                    **(dict(TEXCOORD_0=uvacc) if uvacc is not None else {})),
+                                                     indices=idx, **(dict(material=0) if tex else {}),
                                                      **(dict(targets=targets) if targets else {}))],
                      **(dict(weights=[0.0] * len(targets)) if targets else {}))],
         skins=[dict(joints=list(range(n_joints)), inverseBindMatrices=ibm, skeleton=roots[0])],
         animations=[dict(name="GEM-X", channels=channels, samplers=samplers)],
         buffers=[dict(byteLength=len(buf.data))], bufferViews=buf.views, accessors=buf.accessors)
+    if tex:
+        while len(buf.data) % 4:
+            buf.data += b"\0"
+        buf.views.append(dict(buffer=0, byteOffset=len(buf.data), byteLength=len(tex["bytes"])))
+        buf.data += tex["bytes"]
+        gltf["bufferViews"] = buf.views; gltf["buffers"] = [dict(byteLength=len(buf.data))]
+        gltf["images"] = [dict(bufferView=len(buf.views) - 1, mimeType=tex["mime"])]
+        gltf["samplers"] = [dict(magFilter=9729, minFilter=9987, wrapS=33071, wrapT=33071)]
+        gltf["textures"] = [dict(source=0, sampler=0)]
+        gltf["materials"] = [dict(name="seed-bake", pbrMetallicRoughness=dict(baseColorTexture=dict(index=0),
+                                  metallicFactor=0.0, roughnessFactor=1.0), doubleSided=False)]
     js = json.dumps(gltf, separators=(",", ":")).encode()
     js += b" " * (-len(js) % 4)
     while len(buf.data) % 4:
@@ -168,6 +205,7 @@ def main():
 
     report = dict(out=str(a.out), bytes=len(blob), frames=n_frames, joints=n_joints, vertices=len(bind_vertices),
                   faces=len(faces), fps=a.fps, maxInfluences=a.max_influences, correctiveMorphTargets=len(targets),
+                  texturedFrom=str(a.texture_from) if tex else None, gltfVertices=int(len(R)),
                   droppedWeightMax=float(1 - np.sort(weights, 1)[:, ::-1][:, :a.max_influences].sum(1).min()))
     exact = a.result / "soma-vertices.npy"
     if exact.is_file():
@@ -178,11 +216,11 @@ def main():
         if targets:  # check the exact path: skin (bind + this frame's morph) per sampled frame
             ji = joints.astype(int); errs = []
             for t in sample:
-                skin_t = world[t] @ inverse_bind; blend = np.einsum("vk,vkij->vij", w, skin_t[ji])
-                dlt = np.frombuffer(bytes(buf.data), np.float32, count=len(bind_vertices) * 3,
+                skin_t = world[t] @ inverse_bind; blend = np.einsum("vk,vkij->vij", w[R], skin_t[ji[R]])
+                dlt = np.frombuffer(bytes(buf.data), np.float32, count=len(R) * 3,
                                     offset=buf.views[buf.accessors[targets[t]["POSITION"]]["bufferView"]]["byteOffset"]).reshape(-1, 3)
-                v = bind_vertices + dlt
-                errs.append(np.linalg.norm(np.einsum("vij,vj->vi", blend[:, :3, :3], v) + blend[:, :3, 3] - posed[t], axis=-1))
+                v = bind_vertices[R] + dlt
+                errs.append(np.linalg.norm(np.einsum("vij,vj->vi", blend[:, :3, :3], v) + blend[:, :3, 3] - np.asarray(posed[t])[R], axis=-1))
             e2 = np.concatenate(errs)
             report["exactWithCorrectivesMm"] = dict(median=float(np.median(e2) * 1000), p95=float(np.percentile(e2, 95) * 1000), max=float(e2.max() * 1000))
         report["lbsVsExactMeshMm"] = dict(frames=len(sample), median=float(np.median(err) * 1000),
