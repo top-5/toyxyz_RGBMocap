@@ -5,7 +5,7 @@
 Reads the gemx_result files written by tools/gemx_headless.py:
   soma-rig.npz   (unchanged gemx_result ASSET) names (77,), parents (77,) into the 77 public joints (-1 = root),
                  rest (77,4,4) bind world transforms, faces (F,3), ends
-  soma-skin.npz  (auxiliary; the original ASSET keys stay untouched because gemx_result.load_rig rejects extras)
+  soma-bind.npz  (auxiliary sidecar, also accepted as soma-skin.npz; the original ASSET keys stay untouched because gemx_result.load_rig rejects extras)
                  bind_vertices (V,3) bind mesh in the same frame as rest, skin_weights (V,77) public LBS weights
   soma-world.npy (T,77,4,4) per-frame world transforms (same frame as rest)
   soma-vertices.npy (T,V,3) optional exact posed surface (with correctives): used only to report the LBS error
@@ -92,9 +92,9 @@ def main():
     rig = np.load(a.result / "soma-rig.npz", allow_pickle=False)
     names, parents = [str(n) for n in rig["names"]], rig["parents"].astype(int)
     rest, faces = rig["rest"].astype(np.float64), rig["faces"].astype(np.uint32)
-    skin_file = a.result / "soma-skin.npz"
-    if not skin_file.is_file():
-        raise SystemExit(f"missing {skin_file}: bind_vertices + skin_weights (written by tools/gemx_headless.py)")
+    skin_file = next((a.result / n for n in ("soma-bind.npz", "soma-skin.npz") if (a.result / n).is_file()), None)
+    if skin_file is None:
+        raise SystemExit(f"missing {a.result}/soma-bind.npz: bind_vertices + skin_weights (written by tools/gemx_headless.py)")
     skin_npz = np.load(skin_file, allow_pickle=False)
     bind_vertices, weights = skin_npz["bind_vertices"].astype(np.float64), skin_npz["skin_weights"].astype(np.float64)
     world = np.load(a.result / "soma-world.npy").astype(np.float64)
